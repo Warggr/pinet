@@ -4,10 +4,12 @@ from .affine_equality import EqualityConstraint
 from .affine_inequality import AffineInequalityConstraint
 from .box import BoxConstraint
 from .constraint_parser import ConstraintParser
+from .cross import CrossConstraint
 
 __all__ = [
     "EqualityConstraint",
     "AffineInequalityConstraint",
     "BoxConstraint",
+    "CrossConstraint",
     "ConstraintParser",
 ]

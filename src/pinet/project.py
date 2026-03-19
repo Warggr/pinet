@@ -10,6 +10,7 @@ from .constraints import (
     AffineInequalityConstraint,
     BoxConstraint,
     ConstraintParser,
+    CrossConstraint,
     EqualityConstraint,
 )
 from .dataclasses import EquilibrationParams, ProjectionInstance
@@ -20,16 +21,18 @@ from .solver import build_iteration_step, initialize
 class Project:
     """Projection layer implemented via Douglas-Rachford."""
 
-    eq_constraint: EqualityConstraint = None
-    ineq_constraint: AffineInequalityConstraint = None
-    box_constraint: BoxConstraint = None
+    eq_constraint: EqualityConstraint | None = None
+    ineq_constraint: AffineInequalityConstraint | None = None
+    box_constraint: BoxConstraint | None = None
+    cross_constraint: CrossConstraint | None = None
     unroll: bool = False
 
     def __init__(
         self,
-        eq_constraint: EqualityConstraint = None,
-        ineq_constraint: AffineInequalityConstraint = None,
-        box_constraint: BoxConstraint = None,
+        eq_constraint: EqualityConstraint | None = None,
+        ineq_constraint: AffineInequalityConstraint | None = None,
+        box_constraint: BoxConstraint | None = None,
+        cross_constraint: CrossConstraint | None = None,
         unroll: bool = False,
         equilibration_params: EquilibrationParams = EquilibrationParams(),
     ) -> None:
@@ -39,12 +42,14 @@ class Project:
             eq_constraint (EqualityConstraint): Equality constraint.
             ineq_constraint (AffineInequalityConstraint): Inequality constraint.
             box_constraint (BoxConstraint): Box constraint.
+            cross_constraint (CrossConstraint): Cross constraint.
             unroll (bool): Use loop unrolling for backpropagation.
             equilibration_params (EquilibrationParams): Parameters for equilibration.
         """
         self.eq_constraint = eq_constraint
         self.ineq_constraint = ineq_constraint
         self.box_constraint = box_constraint
+        self.cross_constraint = cross_constraint
         self.unroll = unroll
         self.equilibration_params = equilibration_params
         self.setup()

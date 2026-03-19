@@ -4,6 +4,7 @@ from .constraints import (
     AffineInequalityConstraint,
     BoxConstraint,
     ConstraintParser,
+    CrossConstraint,
     EqualityConstraint,
 )
 from .dataclasses import (
@@ -21,6 +22,7 @@ __all__ = [
     "AffineInequalityConstraint",
     "BoxConstraint",
     "ConstraintParser",
+    "CrossConstraint",
     "ruiz_equilibration",
     "Project",
     "build_iteration_step",
