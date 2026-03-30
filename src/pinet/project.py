@@ -1,7 +1,7 @@
 """Implementation of the projection layer."""
 
 from functools import partial
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 import jax
 from jax import numpy as jnp
@@ -15,7 +15,7 @@ from .constraints import (
 )
 from .dataclasses import EquilibrationParams, ProjectionInstance
 from .equilibration import ruiz_equilibration
-from .solver import build_iteration_step, initialize
+from .solver import build_iteration_step
 
 
 class Project:
@@ -24,7 +24,7 @@ class Project:
     eq_constraint: EqualityConstraint | None = None
     ineq_constraint: AffineInequalityConstraint | None = None
     box_constraint: BoxConstraint | None = None
-    cross_constraint: CrossConstraint | None = None
+    cross_constraint: Sequence[CrossConstraint] = ()
     unroll: bool = False
 
     def __init__(
@@ -32,7 +32,7 @@ class Project:
         eq_constraint: EqualityConstraint | None = None,
         ineq_constraint: AffineInequalityConstraint | None = None,
         box_constraint: BoxConstraint | None = None,
-        cross_constraint: CrossConstraint | None = None,
+        cross_constraints: Sequence[CrossConstraint] = (),
         unroll: bool = False,
         equilibration_params: EquilibrationParams = EquilibrationParams(),
     ) -> None:
@@ -42,14 +42,14 @@ class Project:
             eq_constraint (EqualityConstraint): Equality constraint.
             ineq_constraint (AffineInequalityConstraint): Inequality constraint.
             box_constraint (BoxConstraint): Box constraint.
-            cross_constraint (CrossConstraint): Cross constraint.
+            cross_constraints (CrossConstraint): Cross constraint.
             unroll (bool): Use loop unrolling for backpropagation.
             equilibration_params (EquilibrationParams): Parameters for equilibration.
         """
         self.eq_constraint = eq_constraint
         self.ineq_constraint = ineq_constraint
         self.box_constraint = box_constraint
-        self.cross_constraint = cross_constraint
+        self.cross_constraints = cross_constraints
         self.unroll = unroll
         self.equilibration_params = equilibration_params
         self.setup()
@@ -58,14 +58,21 @@ class Project:
         """Setup the projection layer."""
         constraints = [
             c
-            for c in (self.eq_constraint, self.box_constraint, self.ineq_constraint)
-            if c
+            for c in (
+                self.eq_constraint,
+                self.box_constraint,
+                self.ineq_constraint,
+                *self.cross_constraints,
+            )
+            if c is not None
         ]
         assert len(constraints) > 0, "At least one constraint must be provided."
         self.dim = constraints[0].dim
 
         is_single_simple_constraint = (
-            self.ineq_constraint is None and len(constraints) == 1
+            self.ineq_constraint is None
+            and not self.cross_constraints
+            and len(constraints) == 1
         )
 
         self.dim_lifted = self.dim
@@ -76,16 +83,16 @@ class Project:
         self.d_c = jnp.ones((1, self.single_constraint.dim, 1))
         if not is_single_simple_constraint:
             # Constraints need to be parsed
-            if self.ineq_constraint is not None:
-                self.dim_lifted += self.ineq_constraint.n_constraints
             parser = ConstraintParser(
                 eq_constraint=self.eq_constraint,
                 ineq_constraint=self.ineq_constraint,
                 box_constraint=self.box_constraint,
+                nl_constraints=self.cross_constraints,
             )
             (self.lifted_eq_constraint, self.lifted_box_constraint, self.lift) = (
                 parser.parse(method=None)
             )
+            self.dim_lifted = self.lifted_eq_constraint.dim
             # Only equilibrate when we have a single A
             if (
                 not self.lifted_eq_constraint.var_A
@@ -114,15 +121,6 @@ class Project:
 
             self.lifted_eq_constraint.method = "pinv"
             self.lifted_eq_constraint.setup()
-
-            # Scale the equality RHS
-            self.lifted_eq_constraint.b *= self.d_r
-            # Scale the lifted box constraints
-            mask = self.lifted_box_constraint.mask
-            scale = self.d_c[:, mask, :]
-            self.lifted_box_constraint.scale = 1 / scale
-            self.lifted_box_constraint.ub *= self.lifted_box_constraint.scale
-            self.lifted_box_constraint.lb *= self.lifted_box_constraint.scale
 
             self.step_iteration, self.step_final = build_iteration_step(
                 self.lifted_eq_constraint,
@@ -168,14 +166,7 @@ class Project:
         Returns:
             ProjectionInstance: Initial value for the governing sequence.
         """
-        return initialize(
-            yraw=yraw,
-            ineq_constraint=self.ineq_constraint,
-            box_constraint=self.box_constraint,
-            dim=self.dim,
-            dim_lifted=self.dim_lifted,
-            d_r=self.d_r,
-        )
+        return self.lift(yraw)
 
     def cv(self, y: ProjectionInstance) -> jnp.ndarray:
         """Compute the constraint violation.
@@ -312,6 +303,8 @@ def _project_general(
         tuple[ProjectionInstance, ProjectionInstance]: First output is the projected
             point, and second output is the value of the governing sequence.
     """
+    if dim_lifted != yraw.x.shape[0]:
+        assert n_iter != 0
     if n_iter > 0:
         s0 = initialize_fn(yraw) if s0 is None else s0
         sk, _ = jax.lax.scan(

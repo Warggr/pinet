@@ -1,71 +1,101 @@
 """Cross constraint module."""
 
-from dataclasses import dataclass
+from typing import Literal
 
 import jax.numpy as jnp
 from jax import lax
+from vector_structure import simple_slice_len
 
 from pinet.dataclasses import ProjectionInstance
 
 from .base import Constraint
 
 
-@dataclass
-class CrossConstraintParams:
+class CrossConstraint(Constraint):
     """Cross constraint set.
 
     The cross constraint set is defined as:
     z := x[idxs_z]
-    w := M z - q
+    w := M x[idxs_w] - q
     <z, w> = 0
     z >= 0
     w >= 0
-    """
 
-    M: jnp.ndarray
-    q: jnp.ndarray
-    idxs_z: slice
-
-    def __post_init__(self):
-        """Check dimensions of parameters."""
-        assert (
-            self.M.ndim == 3
-        ), "M is a matrix with shape (batch_size, n_constraints, dimension)."
-
-
-class CrossConstraint(Constraint):
-    """Lifted cross constraint set.
-
-    Defined by:
-    z := x[idxs_z]
-    w := x[idxs_w]
-    <z, w> = 0
-    z >= 0
-    w >= 0
-    It is assumed that w are additional variables from lifting,
-    and that the constraint w = M z - q is enforced somewhere else.
     """
 
     def __init__(
         self,
         idxs_z: slice,
         idxs_w: slice,
-    ) -> None:
-        """Initialize the equality constraint.
+        M: jnp.ndarray | Literal[1] = 1,
+        q: jnp.ndarray | Literal[0] = 0,
+        dim: int | None = None,
+    ):
+        """Constructor.
 
-        Args:
-            idxs_z: the indices of y to be considered, i.e. z = y[idxs_z]
-            idxs_w: idem.
+        Attributes:
+            M: shape (batch_size, n_z, n_w)
+            q: shape (batch_size, n_z, 1) (for consistency with AffineEquality)
+            idxs_w: slice of size n_w
+            idxs_z: slice of size n_z
         """
-        self.idxs_z = idxs_z
         self.idxs_w = idxs_w
+        self.idxs_z = idxs_z
+        self._dim = dim
+        if isinstance(M, (float, int)) and M == 1:
+            self.M = None
+        else:
+            self.M = M
+        if isinstance(q, (float, int)) and q == 0:
+            self.q = None
+        else:
+            self.q = q
 
-        def simple_slice_len(sl: slice):
-            assert sl.step in (1, None)
-            assert sl.stop >= 0 and sl.start >= 0
-            return sl.stop - sl.start
+        if self.M is not None:
+            assert (
+                self.M.ndim == 3
+            ), "M is a matrix with shape (batch_size, n_constraints, dimension)."
+            assert self.M.shape[1] == simple_slice_len(self.idxs_z)
+            assert self.M.shape[2] == simple_slice_len(self.idxs_w)
+        else:
+            assert simple_slice_len(self.idxs_w) == simple_slice_len(self.idxs_z)
+        if self.q is not None:
+            assert (
+                self.q.ndim == 3
+            ), "q is an array with shape (batch_size, n_constraints, 1)."
+            assert self.q.shape[1] == simple_slice_len(self.idxs_z)
+            assert self.q.shape[2] == 1
 
-        assert simple_slice_len(self.idxs_w) == simple_slice_len(self.idxs_z)
+    @property
+    def dim(self) -> int:
+        """Returns the dimension of the constraint set."""
+        if self._dim is None:
+            raise ValueError(
+                "_dim must be provided to CrossConstraint before it can be used"
+            )
+        return self._dim
+
+    def num_auxiliary_variables(self):
+        """The number of auxiliary vars introduced by this constraint."""
+        return simple_slice_len(self.idxs_z)
+
+    def get_auxiliary_variables(self, y):
+        """Construct the auxiliary variables.
+
+        Arguments:
+            y: the lifted vector. Shape (batch_size, dim).
+        """
+        w = self.M @ y[:, self.idxs_w] + self.q
+        return w
+
+    def num_constraints(self):
+        """The number of constraints."""
+        return simple_slice_len(self.idxs_z)
+
+    def get_mask(self) -> jnp.ndarray:
+        """Identifies which variables are affected by these constraints."""
+        mask = jnp.zeros(self.dim).at[self.idxs_w].set(1).at[self.idxs_z].set(1)
+        return mask
 
     def project(self, yraw: ProjectionInstance) -> ProjectionInstance:
         """Project onto constraints.
@@ -77,6 +107,7 @@ class CrossConstraint(Constraint):
         Returns:
             ProjectionInstance: The projected point for each point in the batch.
         """
+        assert self.M is None and self.q is None, "Please lift constraints first"
         w = yraw.x[:, self.idxs_w]
         z = yraw.x[:, self.idxs_z]
         zero = jnp.zeros_like(w)
@@ -87,11 +118,6 @@ class CrossConstraint(Constraint):
         z = jnp.select(_max == w, zero, z)
 
         return yraw.update(x=yraw.x.at[:, self.idxs_w].set(w).at[:, self.idxs_z].set(z))
-
-    @property
-    def dim(self) -> int:
-        """Return the dimension of the constraint set."""
-        return self.idxs_w.stop - self.idxs_z.start
 
     @property
     def n_constraints(self) -> int:
@@ -117,7 +143,7 @@ class CrossConstraint(Constraint):
         w = yraw.x[:, self.idxs_w]
         z = yraw.x[:, self.idxs_z]
 
-        return jnp.concatenate(
+        cvs = jnp.concatenate(
             [
                 lax.max(-w, 0),
                 lax.max(-z, 0),
@@ -125,3 +151,4 @@ class CrossConstraint(Constraint):
             ],
             axis=1,
         )
+        return jnp.max(cvs, axis=1).reshape((-1, 1, 1))

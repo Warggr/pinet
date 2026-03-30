@@ -1,61 +1,18 @@
 """Parser of constraints to lifted representation module."""
 
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 import jax.numpy as jnp
 import numpy as np
+from vector_structure import VectorStructure, simple_slice_len
 
 from pinet.dataclasses import BoxConstraintSpecification
 
 from .affine_equality import EqualityConstraint
 from .affine_inequality import AffineInequalityConstraint
 from .box import BoxConstraint
+from .cartesian_constraint import CartesianConstraint
 from .cross import CrossConstraint
-
-
-class VectorStructure:
-    """Helper class to describe block vectors and block matrices."""
-
-    def __init__(self, sizes: Sequence[tuple[str, int]]):
-        """Constructor."""
-        cuts = {}
-        start = 0
-        for k, v in sizes:
-            cuts[k] = slice(start, start + v)
-            start += v
-        self.size = start
-        self.cuts = cuts
-
-    def __getitem__(self, idx: str | Sequence[str] | slice) -> slice:
-        """Get item."""
-        if isinstance(idx, str):
-            return self.cuts[idx]
-        elif isinstance(idx, slice):
-            if idx.step is not None:
-                raise ValueError("slice step [start:stop:step] not supported")
-            start, stop = None, None
-            if idx.start is None:
-                start = 0
-            if idx.stop is None:
-                stop = self.size
-            for name, cut in self.cuts.items():
-                if name == idx.start:
-                    start = cut.start
-                if name == idx.stop:
-                    stop = cut.start
-                    break
-            if start is None or stop is None:
-                raise ValueError(f"{idx.start} or {idx.stop} not found")
-            return slice(start, stop)
-        else:
-            first, *more = idx
-            start = self.cuts[first].start
-            stop = self.cuts[first].stop
-            for idx in more:
-                next_cut = self.cuts[idx]
-                assert next_cut.start == stop
-                stop = next_cut.stop
-            return slice(start, stop)
 
 
 class ConstraintParser:
@@ -69,8 +26,8 @@ class ConstraintParser:
         self,
         eq_constraint: EqualityConstraint | None,
         ineq_constraint: AffineInequalityConstraint | None,
-        cross_constraint: CrossConstraint | None = None,
         box_constraint: BoxConstraint | None = None,
+        nl_constraints: Sequence[CrossConstraint] = (),
     ) -> None:
         """Initiaze the constraint parser.
 
@@ -78,16 +35,14 @@ class ConstraintParser:
             eq_constraint (EqualityConstraint): An equality constraint.
             ineq_constraint (AffineInequalityConstraint): An inequality constraint.
             box_constraint (BoxConstraint): A box constraint.
-            cross_constraint (CrossConstraint): A cross constraint.
+            nl_constraints (CrossConstraint): A cross constraint.
         """
-        if ineq_constraint is None and cross_constraint is None:
+        if ineq_constraint is None and not nl_constraints:
             # The constraints do not need lifting.
             self.parse = lambda method: (eq_constraint, box_constraint, lambda y: y)
             return
 
-        self.dim = (
-            ineq_constraint.dim if ineq_constraint is not None else cross_constraint.dim
-        )
+        self.n_ineq = ineq_constraint.n_constraints if ineq_constraint else 0
         if eq_constraint is None:
             eq_constraint = EqualityConstraint(
                 A=jnp.empty((1, 0, self.dim)),
@@ -100,21 +55,16 @@ class ConstraintParser:
         self.eq_constraint = eq_constraint
         self.n_eq = eq_constraint.n_constraints
         self.ineq_constraint = ineq_constraint
-        self.n_ineq = ineq_constraint.n_constraints if ineq_constraint else 0
         self.box_constraint = box_constraint
-        self.cross_constraint = cross_constraint
-        self.n_cross = cross_constraint.n_constraints if cross_constraint else 0
+        self.nl_constraints = nl_constraints
+        self.n_cross = sum(lc.num_auxiliary_variables() for lc in self.nl_constraints)
 
-        vector_structure = [("y", self.dim)]
-        if ineq_constraint is not None:
-            vector_structure.append(("y_aux", self.n_ineq))
-        if cross_constraint is not None:
-            vector_structure += [
-                ("w", self.cross_constraint.dim),
-                ("z'", self.cross_constraint.dim),
-                ("w'", self.cross_constraint.dim),
-            ]
+        vector_structure = [("y", eq_constraint.dim)]
+        vector_structure.append(("y_aux", self.n_ineq))
+        for i, lc in enumerate(nl_constraints):
+            vector_structure.append((f"w_{i}", lc.num_auxiliary_variables()))
         self.vector_structure = VectorStructure(vector_structure)
+        self.dim = self.vector_structure.size
 
         # Batch consistency checks
         self.batch_size = self.eq_constraint.A.shape[0]
@@ -140,7 +90,7 @@ class ConstraintParser:
 
     def parse(
         self, method: Optional[str] = "pinv"
-    ) -> tuple[EqualityConstraint, BoxConstraint, CrossConstraint]:
+    ) -> tuple[EqualityConstraint, CartesianConstraint | BoxConstraint, Callable]:
         """Parse the constraints into a lifted representation.
 
         Args:
@@ -153,7 +103,7 @@ class ConstraintParser:
         # Build lifted A matrix.
         # Maximum batch size between A and C
         mbAC = self.batch_size
-        rows, bs = [], []
+        As, bs = [], []
         first_row_batched = jnp.tile(
             jnp.concatenate(
                 [
@@ -162,7 +112,7 @@ class ConstraintParser:
                         shape=(
                             self.eq_constraint.A.shape[0],
                             self.n_eq,
-                            self.n_ineq + self.n_cross,
+                            simple_slice_len(self.vector_structure["y_aux":]),
                         )
                     ),
                 ],
@@ -170,8 +120,6 @@ class ConstraintParser:
             ),
             (mbAC // self.eq_constraint.A.shape[0], 1, 1),
         )
-        rows.append(first_row_batched)
-        bs.append(self.eq_constraint.b)
 
         if self.ineq_constraint:
             second_row_batched = jnp.tile(
@@ -186,7 +134,7 @@ class ConstraintParser:
                             shape=(
                                 self.ineq_constraint.C.shape[0],
                                 self.n_ineq,
-                                self.n_cross,
+                                simple_slice_len(self.vector_structure["w"]),
                             )
                         ),
                     ],
@@ -194,47 +142,35 @@ class ConstraintParser:
                 ),
                 (mbAC // self.ineq_constraint.C.shape[0], 1, 1),
             )
-            rows.append(second_row_batched)
+            As.append(second_row_batched)
             bs.append(jnp.zeros(shape=(self.eq_constraint.b.shape[0], self.n_ineq, 1)))
-        if self.cross_constraint:
-            row = jnp.zeros(
-                shape=(
-                    self.cross_constraint.M.shape[0],
-                    self.cross_constraint.M.shape[1],
-                    self.vector_structure.size,
+        for i, lc in enumerate(self.nl_constraints):
+            if lc.M is not None or lc.q is not None:
+                batch_size = 1
+                if lc.M is not None:
+                    batch_size = lc.M.shape[0]
+                row = jnp.zeros(
+                    shape=(
+                        batch_size,
+                        lc.num_constraints(),
+                        self.vector_structure.size,
+                    )
                 )
-            )
-            row = row.at[:, :, self.cross_constraint.idxs_z].set(
-                -self.cross_constraint.M
-            )
-            row = row.at[:, :, self.vector_structure["w"]].set(
-                jnp.expand_dims(jnp.eye(self.n_cross), axis=0)
-            )
-            row = jnp.tile(row, (mbAC // self.cross_constraint.M.shape[0], 1, 1))
-            rows.append(row)
-            bs.append(self.cross_constraint.q)
-
-            row = jnp.zeros(
-                shape=(self.cross_constraint.M.shape[1], self.vector_structure.size)
-            )
-            row = row.at[:, :, self.cross_constraint.idxs_z].set(-jnp.eye(self.n_cross))
-            row = row.at[:, :, self.vector_structure["z'"]].set(jnp.eye(self.n_cross))
-            row = jnp.expand_dims(row, axis=0)
-            row = jnp.tile(row, (mbAC // self.cross_constraint.M.shape[0], 1, 1))
-            rows.append(row)
-            bs.append(jnp.zeros(1, self.n_cross, 1))
-
-            row = jnp.zeros(
-                shape=(self.cross_constraint.M.shape[1], self.vector_structure.size)
-            )
-            row = row.at[:, :, self.vector_structure["w"]].set(-jnp.eye(self.n_cross))
-            row = row.at[:, :, self.vector_structure["w'"]].set(jnp.eye(self.n_cross))
-            row = jnp.expand_dims(row, axis=0)
-            row = jnp.tile(row, (mbAC // self.cross_constraint.M.shape[0], 1, 1))
-            rows.append(row)
-            bs.append(jnp.zeros(1, self.n_cross, 1))
-        A_lifted = jnp.concatenate(rows, axis=1)
-        b_lifted = jnp.concatenate(bs, axis=1)
+                if lc.M is not None:
+                    row = row.at[:, :, lc.idxs_w].set(-lc.M)
+                else:
+                    row = row.at[:, :, lc.idxs_w].set(
+                        -jnp.eye(simple_slice_len(lc.idxs_w))
+                    )
+                row = row.at[:, :, self.vector_structure[f"w_{i}"]].set(
+                    jnp.expand_dims(jnp.eye(lc.num_constraints()), axis=0)
+                )
+                row = jnp.tile(row, (mbAC // batch_size, 1, 1))
+                assert row.shape[-1] == self.vector_structure.size
+                As.append(row)
+                bs.append(lc.q)
+        A_lifted = jnp.concatenate([first_row_batched, *As], axis=1)
+        b_lifted = jnp.concatenate([self.eq_constraint.b, *bs], axis=1)
         eq_lifted = EqualityConstraint(
             A=A_lifted,
             b=b_lifted,
@@ -243,7 +179,9 @@ class ConstraintParser:
             var_A=self.eq_constraint.var_A,
         )
 
-        if self.box_constraint is None:
+        if self.ineq_constraint is None:
+            box_lifted = self.box_constraint
+        elif self.box_constraint is None:
             # We only project the lifted part.
             box_mask = np.concatenate(
                 [np.zeros(self.dim, dtype=bool), np.ones(self.n_ineq, dtype=bool)]
@@ -307,30 +245,58 @@ class ConstraintParser:
                 )
             )
 
+        cross_lifted = [
+            CrossConstraint(
+                idxs_z=lc.idxs_z,
+                idxs_w=self.vector_structure[f"w_{i}"],
+                M=None,
+                q=None,
+                dim=self.dim,
+            )
+            for i, lc in enumerate(self.nl_constraints)
+        ]
+
+        cartesian = CartesianConstraint(box_lifted, cross_lifted)
+
         def lift(y):
             """Lift the input to the lifted dimension."""
             xs = [y.x]
             if self.ineq_constraint:
                 xs.append(self.ineq_constraint.C @ y.x)
-            if self.cross_constraint:
-                z = y.x[self.cross_constraint.idxs_z]
-                w = self.cross_constraint.M @ z + self.cross_constraint.q
-                xs += [w, z, w]
+            for nl in self.nl_constraints:
+                xs.append(nl.get_auxiliary_variables(y.x))
             y = y.update(x=jnp.concatenate(xs, axis=1))
             if self.eq_constraint.var_b:
+                bs_batch = [
+                    jnp.tile(b, (y.eq.b.shape[0] // b.shape[0], 1, 1)) for b in bs
+                ]
                 y = y.update(
                     eq=y.eq.update(
                         b=jnp.concatenate(
                             [
                                 y.eq.b,
-                                jnp.zeros(
-                                    (y.x.shape[0], self.n_ineq + 3 * self.n_cross, 1)
-                                ),
+                                *bs_batch,
                             ],
                             axis=1,
                         )
                     )
                 )
+            if self.eq_constraint.var_A:
+                As_batch = [
+                    jnp.tile(A, (y.eq.A.shape[0] // A.shape[0], 1, 1)) for A in As
+                ]
+                y = y.update(
+                    eq=y.eq.update(
+                        A=jnp.concatenate(
+                            [
+                                y.eq.A,
+                                *As_batch,
+                            ],
+                            axis=1,
+                        )
+                    )
+                )
+
             return y
 
-        return (eq_lifted, box_lifted, lift)
+        return (eq_lifted, cartesian, lift)

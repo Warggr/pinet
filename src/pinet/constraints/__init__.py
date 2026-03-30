@@ -3,6 +3,7 @@
 from .affine_equality import EqualityConstraint
 from .affine_inequality import AffineInequalityConstraint
 from .box import BoxConstraint
+from .cartesian_constraint import CartesianConstraint
 from .constraint_parser import ConstraintParser
 from .cross import CrossConstraint
 
@@ -10,6 +11,7 @@ __all__ = [
     "EqualityConstraint",
     "AffineInequalityConstraint",
     "BoxConstraint",
+    "CartesianConstraint",
     "CrossConstraint",
     "ConstraintParser",
 ]

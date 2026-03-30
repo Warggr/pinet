@@ -107,11 +107,14 @@ class EqualityConstraint(Constraint):
                 A (jnp.ndarray): Left hand side matrix.
                     Shape (batch_size, n_constraints, dimension).
                 Apinv (jnp.ndarray): Pseudo-inverse of A.
-                    Shape (batch_size, n_constraints, dimension).
+                    Shape (batch_size, dimension, n_constraints).
         """
         b = inp.eq.b if inp.eq and inp.eq.b is not None else self.b
         A = inp.eq.A if inp.eq and self.var_A else self.A
         Apinv = inp.eq.Apinv if inp.eq and self.var_A else self.Apinv
+        assert b.shape[2] == 1
+        assert b.shape[1] == A.shape[1] == Apinv.shape[2]
+        assert Apinv.shape[1] == A.shape[2] == inp.x.shape[1]
 
         return b, A, Apinv
 
