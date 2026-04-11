@@ -303,7 +303,7 @@ def _project_general(
         tuple[ProjectionInstance, ProjectionInstance]: First output is the projected
             point, and second output is the value of the governing sequence.
     """
-    if dim_lifted != yraw.x.shape[0]:
+    if dim_lifted != yraw.x.shape[1]:
         assert n_iter != 0
     if n_iter > 0:
         s0 = initialize_fn(yraw) if s0 is None else s0
